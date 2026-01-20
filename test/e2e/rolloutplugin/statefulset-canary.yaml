@@ -40,8 +40,6 @@ spec:
         - containerPort: 80
   updateStrategy:
     type: RollingUpdate
-    rollingUpdate:
-      partition: 5
 ---
 apiVersion: argoproj.io/v1alpha1
 kind: RolloutPlugin
@@ -60,7 +58,7 @@ spec:
     canary:
       steps:
       - setWeight: 20
-      - pause: {duration: 3s}
+      - pause: {duration: 30s}
       - setWeight: 40
       - pause: {duration: 30s}
       - setWeight: 100
