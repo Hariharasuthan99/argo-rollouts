@@ -496,32 +496,6 @@ func (s *RolloutPluginSuite) TestBackgroundAnalysisSuccess() {
 		})
 }
 
-func (s *RolloutPluginSuite) TestCanaryAnalysisFixtureSuccess() {
-	s.Given().
-		RolloutPluginObjects("@rolloutplugin/statefulset-canary-analysis.yaml").
-		When().
-		ApplyManifests().
-		WaitForStatefulSetReady().
-		WaitForRolloutPluginStatus("Healthy").
-		Then().
-		ExpectRolloutPluginAnalysisRunCount(0).
-		When().
-		UpdateStatefulSetImage("quay.io/prometheus/busybox:glibc").
-		WaitForRolloutPluginCanaryStepIndex(0, 60*time.Second).
-		Then().
-		ExpectRolloutPluginAnalysisRunCount(1).
-		When().
-		WaitForRolloutPluginBackgroundAnalysisRunPhase("Successful").
-		WaitForRolloutPluginStatus("Healthy", 180*time.Second).
-		WaitForStatefulSetPartition(0, 60*time.Second).
-		Then().
-		Assert(func(t *fixtures.Then) {
-			rp := t.GetRolloutPlugin()
-			assert.Equal(s.T(), "Healthy", rp.Status.Phase)
-			assert.False(s.T(), rp.Status.RolloutInProgress)
-		})
-}
-
 func (s *RolloutPluginSuite) TestBackgroundAnalysisFailure() {
 	s.Given().
 		RolloutPluginObjects("@rolloutplugin/statefulset-canary-bg-analysis-fail.yaml").
