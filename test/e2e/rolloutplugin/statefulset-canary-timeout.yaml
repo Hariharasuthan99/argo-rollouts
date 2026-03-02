@@ -1,0 +1,57 @@
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: test-sts-timeout-svc
+spec:
+  clusterIP: None
+  selector:
+    app: test-sts-timeout
+  ports:
+  - port: 80
+    name: web
+---
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  name: test-sts-timeout
+spec:
+  serviceName: test-sts-timeout-svc
+  replicas: 3
+  selector:
+    matchLabels:
+      app: test-sts-timeout
+  template:
+    metadata:
+      labels:
+        app: test-sts-timeout
+    spec:
+      terminationGracePeriodSeconds: 1
+      containers:
+      - name: busybox
+        image: quay.io/prometheus/busybox:latest
+        command: ["sleep", "3600"]
+        ports:
+        - containerPort: 80
+  updateStrategy:
+    type: RollingUpdate
+    rollingUpdate:
+      partition: 3
+---
+apiVersion: argoproj.io/v1alpha1
+kind: RolloutPlugin
+metadata:
+  name: test-sts-timeout-rollout
+spec:
+  workloadRef:
+    apiVersion: apps/v1
+    kind: StatefulSet
+    name: test-sts-timeout
+  plugin:
+    name: statefulset
+  progressDeadlineSeconds: 10
+  progressDeadlineAbort: true
+  strategy:
+    canary:
+      steps:
+      - setWeight: 100
