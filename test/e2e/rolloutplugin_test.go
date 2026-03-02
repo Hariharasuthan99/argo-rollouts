@@ -496,6 +496,32 @@ func (s *RolloutPluginSuite) TestBackgroundAnalysisSuccess() {
 		})
 }
 
+func (s *RolloutPluginSuite) TestCanaryAnalysisFixtureSuccess() {
+	s.Given().
+		RolloutPluginObjects("@rolloutplugin/statefulset-canary-analysis.yaml").
+		When().
+		ApplyManifests().
+		WaitForStatefulSetReady().
+		WaitForRolloutPluginStatus("Healthy").
+		Then().
+		ExpectRolloutPluginAnalysisRunCount(0).
+		When().
+		UpdateStatefulSetImage("quay.io/prometheus/busybox:glibc").
+		WaitForRolloutPluginCanaryStepIndex(0, 60*time.Second).
+		Then().
+		ExpectRolloutPluginAnalysisRunCount(1).
+		When().
+		WaitForRolloutPluginBackgroundAnalysisRunPhase("Successful").
+		WaitForRolloutPluginStatus("Healthy", 180*time.Second).
+		WaitForStatefulSetPartition(0, 60*time.Second).
+		Then().
+		Assert(func(t *fixtures.Then) {
+			rp := t.GetRolloutPlugin()
+			assert.Equal(s.T(), "Healthy", rp.Status.Phase)
+			assert.False(s.T(), rp.Status.RolloutInProgress)
+		})
+}
+
 func (s *RolloutPluginSuite) TestBackgroundAnalysisFailure() {
 	s.Given().
 		RolloutPluginObjects("@rolloutplugin/statefulset-canary-bg-analysis-fail.yaml").
@@ -743,5 +769,30 @@ func (s *RolloutPluginSuite) TestValidSpecNoInvalidCondition() {
 					s.T().Errorf("InvalidSpec condition should not be present on valid spec, but found: %+v", cond)
 				}
 			}
+		})
+}
+
+func (s *RolloutPluginSuite) TestProgressDeadlineTimeoutAbortsRollout() {
+	s.Given().
+		RolloutPluginObjects("@rolloutplugin/statefulset-canary-timeout.yaml").
+		When().
+		ApplyManifests().
+		WaitForStatefulSetReady().
+		WaitForRolloutPluginStatus("Healthy").
+		UpdateStatefulSetImage("quay.io/prometheus/does-not-exist:nope").
+		WaitForRolloutPluginStatus("Degraded", 120*time.Second).
+		Then().
+		Assert(func(t *fixtures.Then) {
+			rp := t.GetRolloutPlugin()
+			assert.True(s.T(), rp.Status.Aborted, "rollout should be aborted after progress deadline timeout")
+
+			var timedOut bool
+			for _, cond := range rp.Status.Conditions {
+				if cond.Type == "Progressing" && cond.Reason == "ProgressDeadlineExceeded" {
+					timedOut = true
+					break
+				}
+			}
+			assert.True(s.T(), timedOut, "Progressing condition should have ProgressDeadlineExceeded reason")
 		})
 }
