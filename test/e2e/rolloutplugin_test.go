@@ -745,3 +745,28 @@ func (s *RolloutPluginSuite) TestValidSpecNoInvalidCondition() {
 			}
 		})
 }
+
+func (s *RolloutPluginSuite) TestProgressDeadlineTimeoutAbortsRollout() {
+	s.Given().
+		RolloutPluginObjects("@rolloutplugin/statefulset-canary-timeout.yaml").
+		When().
+		ApplyManifests().
+		WaitForStatefulSetReady().
+		WaitForRolloutPluginStatus("Healthy").
+		UpdateStatefulSetImage("quay.io/prometheus/does-not-exist:nope").
+		WaitForRolloutPluginStatus("Degraded", 120*time.Second).
+		Then().
+		Assert(func(t *fixtures.Then) {
+			rp := t.GetRolloutPlugin()
+			assert.True(s.T(), rp.Status.Aborted, "rollout should be aborted after progress deadline timeout")
+
+			var timedOut bool
+			for _, cond := range rp.Status.Conditions {
+				if cond.Type == "Progressing" && cond.Reason == "ProgressDeadlineExceeded" {
+					timedOut = true
+					break
+				}
+			}
+			assert.True(s.T(), timedOut, "Progressing condition should have ProgressDeadlineExceeded reason")
+		})
+}
