@@ -22,7 +22,6 @@ func validRolloutPlugin() *v1alpha1.RolloutPlugin {
 			},
 			Plugin: v1alpha1.PluginConfig{Name: "plugin"},
 			Strategy: v1alpha1.RolloutPluginStrategy{
-				Type:   "Canary",
 				Canary: &v1alpha1.CanaryStrategy{},
 			},
 		},
@@ -275,51 +274,11 @@ func TestVerifyRolloutPluginSpec(t *testing.T) {
 			wantMsg: "RolloutPlugin spec.plugin.name is required",
 		},
 		{
-			name: "invalid strategy type",
+			name: "missing canary strategy",
 			mutate: func(rp *v1alpha1.RolloutPlugin) {
-				rp.Spec.Strategy.Type = "Invalid"
-			},
-			wantMsg: "RolloutPlugin spec.strategy.type must be 'Canary' or 'BlueGreen'",
-		},
-		{
-			name: "canary type missing canary config",
-			mutate: func(rp *v1alpha1.RolloutPlugin) {
-				rp.Spec.Strategy.Type = "Canary"
 				rp.Spec.Strategy.Canary = nil
 			},
-			wantMsg: "RolloutPlugin spec.strategy.canary is required when strategy type is 'Canary'",
-		},
-		{
-			name: "bluegreen type missing bluegreen config",
-			mutate: func(rp *v1alpha1.RolloutPlugin) {
-				rp.Spec.Strategy.Type = "BlueGreen"
-				rp.Spec.Strategy.BlueGreen = nil
-				rp.Spec.Strategy.Canary = nil
-			},
-			wantMsg: "RolloutPlugin spec.strategy.blueGreen is required when strategy type is 'BlueGreen'",
-		},
-		{
-			name: "both strategies set",
-			mutate: func(rp *v1alpha1.RolloutPlugin) {
-				rp.Spec.Strategy.BlueGreen = &v1alpha1.BlueGreenStrategy{}
-			},
-			wantMsg: "RolloutPlugin cannot have both canary and blueGreen strategies specified",
-		},
-		{
-			name: "no strategy specified when type empty",
-			mutate: func(rp *v1alpha1.RolloutPlugin) {
-				rp.Spec.Strategy.Type = ""
-				rp.Spec.Strategy.Canary = nil
-				rp.Spec.Strategy.BlueGreen = nil
-			},
-			wantMsg: "RolloutPlugin must have either canary or blueGreen strategy specified",
-		},
-		{
-			name: "negative minReadySeconds",
-			mutate: func(rp *v1alpha1.RolloutPlugin) {
-				rp.Spec.MinReadySeconds = -1
-			},
-			wantMsg: "RolloutPlugin spec.minReadySeconds cannot be negative",
+			wantMsg: "RolloutPlugin spec.strategy.canary is required",
 		},
 		{
 			name: "non positive progressDeadlineSeconds",
