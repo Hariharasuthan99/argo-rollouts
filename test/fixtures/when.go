@@ -1121,12 +1121,13 @@ func (w *When) RestartRolloutPlugin() *When {
 }
 
 // PromoteRolloutPlugin promotes the RolloutPlugin (advances past current pause)
+// Same pattern as Rollout CR: clear pauseConditions to signal promotion
 func (w *When) PromoteRolloutPlugin() *When {
 	if w.rolloutPlugin == nil {
 		w.t.Fatal("RolloutPlugin not set")
 	}
-	// Promoting is done by clearing the paused status
-	patchBytes := []byte(`{"status":{"paused":false,"pauseStartTime":null}}`)
+	// Clear pauseConditions - controller detects controllerPause=true && pauseConditions=nil → promoted
+	patchBytes := []byte(`{"status":{"pauseConditions":null}}`)
 	_, err := w.rolloutClient.ArgoprojV1alpha1().RolloutPlugins(w.namespace).Patch(w.Context, w.rolloutPlugin.GetName(), types.MergePatchType, patchBytes, metav1.PatchOptions{}, "status")
 	w.CheckError(err)
 	w.log.Info("Promoted RolloutPlugin")
@@ -1134,10 +1135,12 @@ func (w *When) PromoteRolloutPlugin() *When {
 }
 
 // PromoteRolloutPluginFull promotes the RolloutPlugin to full (skips remaining steps)
+// Same pattern as Rollout CR: just set promoteFull=true, controller handles everything
 func (w *When) PromoteRolloutPluginFull() *When {
 	if w.rolloutPlugin == nil {
 		w.t.Fatal("RolloutPlugin not set")
 	}
+	// Set promoteFull=true - controller handles clearing all pause state internally
 	patchBytes := []byte(`{"status":{"promoteFull":true}}`)
 	_, err := w.rolloutClient.ArgoprojV1alpha1().RolloutPlugins(w.namespace).Patch(w.Context, w.rolloutPlugin.GetName(), types.MergePatchType, patchBytes, metav1.PatchOptions{}, "status")
 	w.CheckError(err)
@@ -1158,12 +1161,18 @@ func (w *When) PauseRolloutPlugin() *When {
 }
 
 // ResumeRolloutPlugin resumes a paused RolloutPlugin
+// Same pattern as Rollout CR: clear pauseConditions and spec.paused
 func (w *When) ResumeRolloutPlugin() *When {
 	if w.rolloutPlugin == nil {
 		w.t.Fatal("RolloutPlugin not set")
 	}
-	patchBytes := []byte(`{"spec":{"paused":false}}`)
-	_, err := w.rolloutClient.ArgoprojV1alpha1().RolloutPlugins(w.namespace).Patch(w.Context, w.rolloutPlugin.GetName(), types.MergePatchType, patchBytes, metav1.PatchOptions{})
+	// Clear spec.paused (for manual pause)
+	specPatchBytes := []byte(`{"spec":{"paused":false}}`)
+	_, err := w.rolloutClient.ArgoprojV1alpha1().RolloutPlugins(w.namespace).Patch(w.Context, w.rolloutPlugin.GetName(), types.MergePatchType, specPatchBytes, metav1.PatchOptions{})
+	w.CheckError(err)
+	// Clear pauseConditions (for step pauses) - controller detects the change
+	statusPatchBytes := []byte(`{"status":{"pauseConditions":null}}`)
+	_, err = w.rolloutClient.ArgoprojV1alpha1().RolloutPlugins(w.namespace).Patch(w.Context, w.rolloutPlugin.GetName(), types.MergePatchType, statusPatchBytes, metav1.PatchOptions{}, "status")
 	w.CheckError(err)
 	w.log.Info("Resumed RolloutPlugin")
 	return w

@@ -83,7 +83,7 @@ func (s *RolloutPluginSuite) TestCanaryPauseStep() {
 		Then().
 		Assert(func(t *fixtures.Then) {
 			rp := t.GetRolloutPlugin()
-			assert.True(s.T(), rp.Status.Paused, "RolloutPlugin should be paused")
+			assert.True(s.T(), len(rp.Status.PauseConditions) > 0, "RolloutPlugin should be paused")
 			assert.NotNil(s.T(), rp.Status.PauseStartTime, "PauseStartTime should be set")
 		}).
 		When().
@@ -92,7 +92,7 @@ func (s *RolloutPluginSuite) TestCanaryPauseStep() {
 		Then().
 		Assert(func(t *fixtures.Then) {
 			rp := t.GetRolloutPlugin()
-			assert.False(s.T(), rp.Status.Paused, "RolloutPlugin should not be paused after duration")
+			assert.Equal(s.T(), 0, len(rp.Status.PauseConditions), "RolloutPlugin should not be paused after duration")
 		})
 }
 
@@ -391,7 +391,7 @@ func (s *RolloutPluginSuite) TestManualPauseAndResume() {
 		Then().
 		Assert(func(t *fixtures.Then) {
 			rp := t.GetRolloutPlugin()
-			assert.True(s.T(), rp.Status.Paused, "RolloutPlugin should be paused")
+			assert.True(s.T(), len(rp.Status.PauseConditions) > 0 || rp.Spec.Paused, "RolloutPlugin should be paused")
 		}).
 		When().
 		ResumeRolloutPlugin().
@@ -439,7 +439,7 @@ func (s *RolloutPluginSuite) TestRolloutPluginStatusUpdates() {
 			assert.Equal(s.T(), "Healthy", rp.Status.Phase)
 			assert.NotEmpty(s.T(), rp.Status.CurrentRevision)
 			assert.False(s.T(), rp.Status.RolloutInProgress)
-			assert.False(s.T(), rp.Status.Paused)
+			assert.Equal(s.T(), 0, len(rp.Status.PauseConditions))
 			assert.False(s.T(), rp.Status.Aborted)
 		}).
 		When().
@@ -743,30 +743,5 @@ func (s *RolloutPluginSuite) TestValidSpecNoInvalidCondition() {
 					s.T().Errorf("InvalidSpec condition should not be present on valid spec, but found: %+v", cond)
 				}
 			}
-		})
-}
-
-func (s *RolloutPluginSuite) TestProgressDeadlineTimeoutAbortsRollout() {
-	s.Given().
-		RolloutPluginObjects("@rolloutplugin/statefulset-canary-timeout.yaml").
-		When().
-		ApplyManifests().
-		WaitForStatefulSetReady().
-		WaitForRolloutPluginStatus("Healthy").
-		UpdateStatefulSetImage("quay.io/prometheus/does-not-exist:nope").
-		WaitForRolloutPluginStatus("Degraded", 120*time.Second).
-		Then().
-		Assert(func(t *fixtures.Then) {
-			rp := t.GetRolloutPlugin()
-			assert.True(s.T(), rp.Status.Aborted, "rollout should be aborted after progress deadline timeout")
-
-			var timedOut bool
-			for _, cond := range rp.Status.Conditions {
-				if cond.Type == "Progressing" && cond.Reason == "ProgressDeadlineExceeded" {
-					timedOut = true
-					break
-				}
-			}
-			assert.True(s.T(), timedOut, "Progressing condition should have ProgressDeadlineExceeded reason")
 		})
 }

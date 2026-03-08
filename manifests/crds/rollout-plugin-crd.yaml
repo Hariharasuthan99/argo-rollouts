@@ -926,6 +926,8 @@ spec:
                   - type
                   type: object
                 type: array
+              controllerPause:
+                type: boolean
               currentRevision:
                 type: string
               currentStepComplete:
@@ -940,11 +942,22 @@ spec:
               observedGeneration:
                 format: int64
                 type: integer
+              pauseConditions:
+                items:
+                  properties:
+                    reason:
+                      type: string
+                    startTime:
+                      format: date-time
+                      type: string
+                  required:
+                  - reason
+                  - startTime
+                  type: object
+                type: array
               pauseStartTime:
                 format: date-time
                 type: string
-              paused:
-                type: boolean
               phase:
                 type: string
               pluginStatus:

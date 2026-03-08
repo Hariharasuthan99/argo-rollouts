@@ -218,7 +218,7 @@ func (r *RolloutPluginReconciler) reconcileStepBasedAnalysisRun(ctx context.Cont
 	}
 
 	// If AR is inconclusive and rollout is paused, allow creating a new one
-	if currentAr.Status.Phase == v1alpha1.AnalysisPhaseInconclusive && rp.Status.Paused {
+	if currentAr.Status.Phase == v1alpha1.AnalysisPhaseInconclusive && (len(rp.Status.PauseConditions) > 0 || rp.Spec.Paused) {
 		logger.Info("Analysis is inconclusive and rollout is paused, creating new step-based analysis run", "step", currentStepIndex)
 		newAr, err := r.createAnalysisRun(ctx, rp, currentStep.Analysis, fmt.Sprintf("%s-step-%d", rp.Name, currentStepIndex), v1alpha1.RolloutTypeStepLabel)
 		if err != nil {
@@ -265,7 +265,7 @@ func (r *RolloutPluginReconciler) reconcileBackgroundAnalysisRun(ctx context.Con
 	}
 
 	// If AR is inconclusive and rollout is paused, allow creating a new one
-	if currentAr.Status.Phase == v1alpha1.AnalysisPhaseInconclusive && rp.Status.Paused {
+	if currentAr.Status.Phase == v1alpha1.AnalysisPhaseInconclusive && (len(rp.Status.PauseConditions) > 0 || rp.Spec.Paused) {
 		logger.Info("Analysis is inconclusive and rollout is paused, creating new background analysis run")
 		newAr, err := r.createAnalysisRun(ctx, rp, &rp.Spec.Strategy.Canary.Analysis.RolloutAnalysis, fmt.Sprintf("%s-background", rp.Name), v1alpha1.RolloutTypeBackgroundRunLabel)
 		if err != nil {

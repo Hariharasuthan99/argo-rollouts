@@ -142,8 +142,20 @@ type RolloutPluginStatus struct {
 	// RolloutInProgress indicates whether a rollout is currently in progress
 	RolloutInProgress bool `json:"rolloutInProgress,omitempty" protobuf:"varint,9,opt,name=rolloutInProgress"`
 
-	// Paused indicates whether the rollout is currently paused
-	Paused bool `json:"paused,omitempty" protobuf:"varint,10,opt,name=paused"`
+	// PauseConditions is a list of reasons why rollout became automatically paused (e.g.
+	// CanaryPauseStep). The items in this list are populated by the controller but are cleared
+	// by the user (e.g. ArgoCD resume action, kubectl patch) when they wish to unpause.
+	// If pause conditions is empty, but controllerPause is true, it indicates
+	// the user manually unpaused the Rollout (same pattern as Rollout CR)
+	// +optional
+	PauseConditions []PauseCondition `json:"pauseConditions,omitempty" protobuf:"bytes,26,rep,name=pauseConditions"`
+
+	// ControllerPause indicates the controller has paused the rollout. It is set to true when
+	// the controller adds a pause condition. This field helps to discern the scenario where a
+	// rollout was resumed after being paused by the controller (e.g. via ArgoCD resume action).
+	// In that situation, the pauseConditions would have been cleared, but controllerPause would
+	// still be set to true. (same pattern as Rollout CR)
+	ControllerPause bool `json:"controllerPause,omitempty" protobuf:"varint,27,opt,name=controllerPause"`
 
 	// PauseStartTime is the time when the rollout was paused
 	// +optional

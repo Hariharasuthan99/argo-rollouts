@@ -2574,6 +2574,13 @@ func (in *RolloutPluginStatus) DeepCopyInto(out *RolloutPluginStatus) {
 		*out = new(int32)
 		**out = **in
 	}
+	if in.PauseConditions != nil {
+		in, out := &in.PauseConditions, &out.PauseConditions
+		*out = make([]PauseCondition, len(*in))
+		for i := range *in {
+			(*in)[i].DeepCopyInto(&(*out)[i])
+		}
+	}
 	if in.PauseStartTime != nil {
 		in, out := &in.PauseStartTime, &out.PauseStartTime
 		*out = (*in).DeepCopy()

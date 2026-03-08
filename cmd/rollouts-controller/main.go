@@ -1,6 +1,7 @@
 package main
 
 import (
+	"encoding/json"
 	"fmt"
 	"net/http"
 	"os"
@@ -9,12 +10,14 @@ import (
 	"time"
 
 	notificationapi "github.com/argoproj/notifications-engine/pkg/api"
+	notificationcontroller "github.com/argoproj/notifications-engine/pkg/controller"
 	"github.com/argoproj/pkg/kubeclientmetrics"
 	"github.com/go-logr/logr"
 	smiclientset "github.com/servicemeshinterface/smi-sdk-go/pkg/gen/client/split/clientset/versioned"
 	log "github.com/sirupsen/logrus"
 	"github.com/spf13/cobra"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
 	k8sruntime "k8s.io/apimachinery/pkg/runtime"
 	utilruntime "k8s.io/apimachinery/pkg/util/runtime"
 	"k8s.io/client-go/discovery"
@@ -61,11 +64,28 @@ const (
 	jsonFormat = "json"
 	textFormat = "text"
 
-	controllerAnalysis = "analysis"
-	listenAddr         = "0.0.0.0:%d"
+	controllerAnalysis      = "analysis"
+	controllerRolloutPlugin = "rolloutplugin"
+	listenAddr              = "0.0.0.0:%d"
 )
 
-var supportedControllers = map[string]bool{controllerAnalysis: true}
+var supportedControllers = map[string]bool{
+	controllerAnalysis:      true,
+	controllerRolloutPlugin: true,
+}
+
+var (
+	scheme = k8sruntime.NewScheme()
+)
+
+func init() {
+	// Set controller-runtime logger to a null logger to suppress the warning
+	// We use logrus for our own logging
+	ctrl.SetLogger(logr.New(ctrllog.NullLogSink{}))
+
+	utilruntime.Must(clientgoscheme.AddToScheme(scheme))
+	utilruntime.Must(v1alpha1.AddToScheme(scheme))
+}
 
 var (
 	scheme = k8sruntime.NewScheme()
@@ -331,144 +351,193 @@ func newCommand() *cobra.Command {
 			// ========================================
 			// Setup RolloutPlugin Controller (controller-runtime)
 			// ========================================
-			log.Info("Setting up RolloutPlugin controller (controller-runtime)")
+			// Only set up RolloutPlugin controller if explicitly enabled
+			// Default behavior (no --controllers flag): Analysis + Rollout controllers (NO RolloutPlugin)
+			// To enable RolloutPlugin, must explicitly use --controllers=rolloutplugin or --controllers=analysis,rolloutplugin
+			setupRolloutPlugin := enabledControllers[controllerRolloutPlugin]
 
-			// Determine leader election namespace
-			leaderElectionNamespace := electOpts.LeaderElectionNamespace
-			if leaderElectionNamespace == "" {
-				if namespaced && namespace != metav1.NamespaceAll {
-					leaderElectionNamespace = namespace
-				} else {
-					leaderElectionNamespace = defaults.Namespace()
+			if setupRolloutPlugin {
+				log.Info("Setting up RolloutPlugin controller (controller-runtime)")
+
+				// Determine leader election namespace
+				leaderElectionNamespace := electOpts.LeaderElectionNamespace
+				if leaderElectionNamespace == "" {
+					if namespaced && namespace != metav1.NamespaceAll {
+						leaderElectionNamespace = namespace
+					} else {
+						leaderElectionNamespace = defaults.Namespace()
+					}
+					// Update electOpts with the computed namespace for standard controllers
+					electOpts.LeaderElectionNamespace = leaderElectionNamespace
 				}
-				// Update electOpts with the computed namespace for standard controllers
-				electOpts.LeaderElectionNamespace = leaderElectionNamespace
-			}
 
-			mgrOpts := ctrl.Options{
-				Scheme: scheme,
-				Metrics: metricsserver.Options{
-					BindAddress: "0", // Disable metrics server, use standard controller's metrics
-				},
-				HealthProbeBindAddress:  "0",   // Disable health probe, use standard controller's healthz
-				LeaderElection:          false, // Integrated controller uses standard controller's leader election
-				LeaderElectionID:        controller.GetLeaderElectionLeaseLockName(),
-				LeaderElectionNamespace: leaderElectionNamespace,
-			}
-			// Configure namespace scoping
-			if namespaced && namespace != metav1.NamespaceAll {
-				log.WithField("namespace", namespace).Info("RolloutPlugin controller running in namespaced mode")
-				mgrOpts.Cache = cache.Options{
-					DefaultNamespaces: map[string]cache.Config{
-						namespace: {},
+				mgrOpts := ctrl.Options{
+					Scheme: scheme,
+					Metrics: metricsserver.Options{
+						BindAddress: "0", // Disable metrics server, use standard controller's metrics
 					},
+					HealthProbeBindAddress:  "0",   // Disable health probe, use standard controller's healthz
+					LeaderElection:          false, // Integrated controller uses standard controller's leader election
+					LeaderElectionID:        controller.GetLeaderElectionLeaseLockName(),
+					LeaderElectionNamespace: leaderElectionNamespace,
 				}
+				// Configure namespace scoping
+				if namespaced && namespace != metav1.NamespaceAll {
+					log.WithField("namespace", namespace).Info("RolloutPlugin controller running in namespaced mode")
+					mgrOpts.Cache = cache.Options{
+						DefaultNamespaces: map[string]cache.Config{
+							namespace: {},
+						},
+					}
+				} else {
+					log.Info("RolloutPlugin controller running in cluster-scoped mode")
+				}
+
+				mgr, err := ctrl.NewManager(config, mgrOpts)
+				if err != nil {
+					log.Fatalf("Failed to create controller-runtime manager: %s", err.Error())
+				}
+
+				// Get the singleton plugin manager instance
+				// This ensures all RolloutPlugin CRs share the same plugin instances
+				pluginManager := rolloutplugin.GetGlobalPluginManager()
+
+				logrusCtx := log.WithField("plugin", "statefulset")
+				// Built-in plugins directly implement rolloutplugin.ResourcePlugin
+				// No wrapper needed - this is more efficient than RPC-based external plugins
+				// Plugin creates its own k8s client and cache in Init()
+				// Pass namespace to ensure plugin respects namespaced mode
+				statefulSetPlugin := statefulset.NewPlugin(logrusCtx, namespace)
+
+				if err := pluginManager.RegisterPlugin("statefulset", statefulSetPlugin); err != nil {
+					log.Fatalf("Failed to register statefulset plugin: %s", err.Error())
+				}
+				log.Info("Registered StatefulSet plugin")
+
+				// Create analysis helper to enable RolloutPlugin controller to reuse AnalysisRun logic
+				// The helper uses listers from the informer-based controller manager
+				analysisHelper := analysishelper.NewHelper(
+					argoprojClient,
+					tolerantinformer.NewTolerantAnalysisRunInformer(dynamicInformerFactory).Lister(),
+					tolerantinformer.NewTolerantAnalysisTemplateInformer(dynamicInformerFactory).Lister(),
+					tolerantinformer.NewTolerantClusterAnalysisTemplateInformer(clusterDynamicInformerFactory).Lister(),
+				)
+
+				// Create EventRecorder for RolloutPlugin notifications
+				// This is similar to the Rollout controller but uses RolloutPlugin-specific API factory settings
+				// Pass AnalysisRun informer to enable analysisRuns variable in notification templates
+				rolloutPluginApiFactory := notificationapi.NewFactory(
+					record.NewAPIFactorySettingsForRolloutPlugin(tolerantinformer.NewTolerantAnalysisRunInformer(dynamicInformerFactory)),
+					defaults.Namespace(),
+					notificationSecretInformerFactory.Core().V1().Secrets().Informer(),
+					notificationConfigMapInformerFactory.Core().V1().ConfigMaps().Informer(),
+				)
+				rolloutPluginRecorder := record.NewEventRecorder(
+					kubeClient,
+					metrics.MetricRolloutEventsTotal,
+					metrics.MetricNotificationFailedTotal,
+					metrics.MetricNotificationSuccessTotal,
+					metrics.MetricNotificationSend,
+					rolloutPluginApiFactory,
+				)
+
+				// Wire up a NotificationController for RolloutPlugin so that standalone custom triggers
+				// (with only a `when` condition, like `trigger.on-statefulset-plugin-rollout`) are
+				// evaluated on every informer update — exactly like the Rollout CR's notificationsController.
+				rolloutPluginNotificationsController := notificationcontroller.NewControllerWithNamespaceSupport(
+					dynamicClient.Resource(v1alpha1.RolloutPluginGVR),
+					tolerantinformer.NewTolerantRolloutPluginInformer(dynamicInformerFactory).Informer(),
+					rolloutPluginApiFactory,
+					notificationcontroller.WithToUnstructured(func(obj metav1.Object) (*unstructured.Unstructured, error) {
+						data, err := json.Marshal(obj)
+						if err != nil {
+							return nil, err
+						}
+						res := &unstructured.Unstructured{}
+						err = json.Unmarshal(data, res)
+						if err != nil {
+							return nil, err
+						}
+						return res, nil
+					}),
+				)
+
+				// Set up the RolloutPlugin controller
+				if err = (&rolloutplugin.RolloutPluginReconciler{
+					Client:            mgr.GetClient(),
+					Scheme:            mgr.GetScheme(),
+					KubeClientset:     kubeClient,
+					ArgoProjClientset: argoprojClient,
+					DynamicClientset:  dynamicClient,
+					PluginManager:     pluginManager,
+					AnalysisHelper:    analysisHelper,
+					InstanceID:        instanceID,
+					MetricsServer:     metricsServer,
+					Recorder:          rolloutPluginRecorder,
+				}).SetupWithManager(mgr); err != nil {
+					log.Fatalf("Failed to setup RolloutPlugin controller: %s", err.Error())
+				}
+
+				// ========================================
+				// Run Both Controller Types Concurrently
+				// ========================================
+				var wg sync.WaitGroup
+
+				// Start standard Argo Rollouts controllers
+				wg.Add(1)
+				go func() {
+					defer wg.Done()
+					log.Info("Starting standard Argo Rollouts controllers")
+					if err := cm.Run(ctx, rolloutThreads, serviceThreads, ingressThreads, experimentThreads, analysisThreads, electOpts); err != nil {
+						log.WithError(err).Error("Error running standard controllers")
+						os.Exit(1)
+					}
+					log.Info("Standard Argo Rollouts controllers stopped")
+				}()
+
+				// Start NotificationController for RolloutPlugin.
+				// This evaluates all subscribed trigger `when` conditions on every informer update,
+				// enabling standalone custom triggers (e.g. trigger.on-statefulset-plugin-rollout)
+				// to fire without needing a matching EventReason — identical to how Rollout CR works.
+				wg.Add(1)
+				go func() {
+					defer wg.Done()
+					log.Info("Starting RolloutPlugin notifications controller")
+					rolloutPluginNotificationsController.Run(rolloutThreads, ctx.Done())
+					log.Info("RolloutPlugin notifications controller stopped")
+				}()
+
+				// Start controller-runtime manager for RolloutPlugin
+				wg.Add(1)
+				go func() {
+					defer wg.Done()
+					log.Info("Starting RolloutPlugin controller (controller-runtime)")
+					if err := mgr.Start(ctx); err != nil {
+						log.WithError(err).Error("Error running RolloutPlugin controller")
+						os.Exit(1)
+					}
+					log.Info("RolloutPlugin controller stopped")
+				}()
+
+				log.Info("All controllers started successfully")
+
+				// Wait for context cancellation
+				<-ctx.Done()
+				log.Info("Received shutdown signal, waiting for controllers to stop")
+
+				// Wait for all controllers to finish
+				wg.Wait()
+				log.Info("All controllers stopped gracefully")
 			} else {
-				log.Info("RolloutPlugin controller running in cluster-scoped mode")
-			}
-
-			mgr, err := ctrl.NewManager(config, mgrOpts)
-			if err != nil {
-				log.Fatalf("Failed to create controller-runtime manager: %s", err.Error())
-			}
-
-			// Get the singleton plugin manager instance
-			// This ensures all RolloutPlugin CRs share the same plugin instances
-			pluginManager := rolloutplugin.GetGlobalPluginManager()
-
-			logrusCtx := log.WithField("plugin", "statefulset")
-			// Built-in plugins directly implement rolloutplugin.ResourcePlugin
-			// No wrapper needed - this is more efficient than RPC-based external plugins
-			// Plugin creates its own k8s client and cache in Init()
-			// Pass namespace to ensure plugin respects namespaced mode
-			statefulSetPlugin := statefulset.NewPlugin(logrusCtx, namespace)
-
-			if err := pluginManager.RegisterPlugin("statefulset", statefulSetPlugin); err != nil {
-				log.Fatalf("Failed to register statefulset plugin: %s", err.Error())
-			}
-			log.Info("Registered StatefulSet plugin")
-
-			// Create analysis helper to enable RolloutPlugin controller to reuse AnalysisRun logic
-			// The helper uses listers from the informer-based controller manager
-			analysisHelper := analysishelper.NewHelper(
-				argoprojClient,
-				tolerantinformer.NewTolerantAnalysisRunInformer(dynamicInformerFactory).Lister(),
-				tolerantinformer.NewTolerantAnalysisTemplateInformer(dynamicInformerFactory).Lister(),
-				tolerantinformer.NewTolerantClusterAnalysisTemplateInformer(clusterDynamicInformerFactory).Lister(),
-			)
-
-			// Create EventRecorder for RolloutPlugin notifications
-			// This is similar to the Rollout controller but uses RolloutPlugin-specific API factory settings
-			// Pass AnalysisRun informer to enable analysisRuns variable in notification templates
-			rolloutPluginApiFactory := notificationapi.NewFactory(
-				record.NewAPIFactorySettingsForRolloutPlugin(tolerantinformer.NewTolerantAnalysisRunInformer(dynamicInformerFactory)),
-				defaults.Namespace(),
-				notificationSecretInformerFactory.Core().V1().Secrets().Informer(),
-				notificationConfigMapInformerFactory.Core().V1().ConfigMaps().Informer(),
-			)
-			rolloutPluginRecorder := record.NewEventRecorder(
-				kubeClient,
-				metrics.MetricRolloutEventsTotal,
-				metrics.MetricNotificationFailedTotal,
-				metrics.MetricNotificationSuccessTotal,
-				metrics.MetricNotificationSend,
-				rolloutPluginApiFactory,
-			)
-
-			// Set up the RolloutPlugin controller
-			if err = (&rolloutplugin.RolloutPluginReconciler{
-				Client:            mgr.GetClient(),
-				Scheme:            mgr.GetScheme(),
-				KubeClientset:     kubeClient,
-				ArgoProjClientset: argoprojClient,
-				DynamicClientset:  dynamicClient,
-				PluginManager:     pluginManager,
-				AnalysisHelper:    analysisHelper,
-				InstanceID:        instanceID,
-				MetricsServer:     metricsServer,
-				Recorder:          rolloutPluginRecorder,
-			}).SetupWithManager(mgr); err != nil {
-				log.Fatalf("Failed to setup RolloutPlugin controller: %s", err.Error())
-			}
-
-			// ========================================
-			// Run Both Controller Types Concurrently
-			// ========================================
-			var wg sync.WaitGroup
-
-			// Start standard Argo Rollouts controllers
-			wg.Add(1)
-			go func() {
-				defer wg.Done()
+				// RolloutPlugin controller is disabled, run only standard controllers
+				log.Info("RolloutPlugin controller disabled, running only standard controllers")
 				log.Info("Starting standard Argo Rollouts controllers")
 				if err := cm.Run(ctx, rolloutThreads, serviceThreads, ingressThreads, experimentThreads, analysisThreads, electOpts); err != nil {
 					log.WithError(err).Error("Error running standard controllers")
-					os.Exit(1)
+					return err
 				}
-				log.Info("Standard Argo Rollouts controllers stopped")
-			}()
-
-			// Start controller-runtime manager for RolloutPlugin
-			wg.Add(1)
-			go func() {
-				defer wg.Done()
-				log.Info("Starting RolloutPlugin controller (controller-runtime)")
-				if err := mgr.Start(ctx); err != nil {
-					log.WithError(err).Error("Error running RolloutPlugin controller")
-					os.Exit(1)
-				}
-				log.Info("RolloutPlugin controller stopped")
-			}()
-
-			log.Info("All controllers started successfully")
-
-			// Wait for context cancellation
-			<-ctx.Done()
-			log.Info("Received shutdown signal, waiting for controllers to stop")
-
-			// Wait for all controllers to finish
-			wg.Wait()
-			log.Info("All controllers stopped gracefully")
+				log.Info("Standard Argo Rollouts controllers stopped gracefully")
+			}
 
 			return nil
 		},
@@ -517,7 +586,7 @@ func newCommand() *cobra.Command {
 	command.Flags().DurationVar(&electOpts.LeaderElectionRenewDeadline, "leader-election-renew-deadline", controller.DefaultLeaderElectionRenewDeadline, "The interval between attempts by the acting master to renew a leadership slot before it stops leading. This must be less than or equal to the lease duration. This is only applicable if leader election is enabled.")
 	command.Flags().DurationVar(&electOpts.LeaderElectionRetryPeriod, "leader-election-retry-period", controller.DefaultLeaderElectionRetryPeriod, "The duration the clients should wait between attempting acquisition and renewal of a leadership. This is only applicable if leader election is enabled.")
 	command.Flags().BoolVar(&selfServiceNotificationEnabled, "self-service-notification-enabled", false, "Allows rollouts controller to pull notification config from the namespace that the rollout resource is in. This is useful for self-service notification.")
-	command.Flags().StringSliceVar(&controllersEnabled, "controllers", nil, "Explicitly specify the list of controllers to run, currently only supports 'analysis', eg. --controller=analysis. Default: all controllers are enabled")
+	command.Flags().StringSliceVar(&controllersEnabled, "controllers", nil, "Explicitly specify the list of controllers to run. Supported values: 'analysis', 'rolloutplugin'. Examples: --controllers=analysis (analysis only), --controllers=rolloutplugin (rolloutplugin only), --controllers=analysis,rolloutplugin (analysis + rolloutplugin). Default: analysis + rollout/experiment/service/ingress controllers (no rolloutplugin)")
 	command.Flags().StringVar(&pprofAddress, "enable-pprof-address", "", "Enable pprof profiling on controller by providing a server address.")
 	return &command
 }

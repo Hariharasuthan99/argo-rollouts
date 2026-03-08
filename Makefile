@@ -273,7 +273,7 @@ setup-e2e:
 .PHONY: start-e2e
 start-e2e: ## start e2e test environment
 	mkdir -p coverage-output-e2e
-	GOCOVERDIR=coverage-output-e2e go run -cover ./cmd/rollouts-controller/main.go --instance-id ${E2E_INSTANCE_ID} --loglevel debug --kloglevel 6
+	GOCOVERDIR=coverage-output-e2e go run -cover ./cmd/rollouts-controller/main.go --instance-id ${E2E_INSTANCE_ID} --loglevel debug --kloglevel 6 --controllers=rolloutplugin
 
 .PHONY: test-e2e
 test-e2e: install-devtools-local

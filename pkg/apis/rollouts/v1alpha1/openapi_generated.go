@@ -4869,9 +4869,23 @@ func schema_pkg_apis_rollouts_v1alpha1_RolloutPluginStatus(ref common.ReferenceC
 							Format:      "",
 						},
 					},
-					"paused": {
+					"pauseConditions": {
 						SchemaProps: spec.SchemaProps{
-							Description: "Paused indicates whether the rollout is currently paused",
+							Description: "PauseConditions is a list of reasons why rollout became automatically paused (e.g. CanaryPauseStep). The items in this list are populated by the controller but are cleared by the user (e.g. ArgoCD resume action, kubectl patch) when they wish to unpause. If pause conditions is empty, but controllerPause is true, it indicates the user manually unpaused the Rollout (same pattern as Rollout CR)",
+							Type:        []string{"array"},
+							Items: &spec.SchemaOrArray{
+								Schema: &spec.Schema{
+									SchemaProps: spec.SchemaProps{
+										Default: map[string]interface{}{},
+										Ref:     ref("github.com/argoproj/argo-rollouts/pkg/apis/rollouts/v1alpha1.PauseCondition"),
+									},
+								},
+							},
+						},
+					},
+					"controllerPause": {
+						SchemaProps: spec.SchemaProps{
+							Description: "ControllerPause indicates the controller has paused the rollout. It is set to true when the controller adds a pause condition. This field helps to discern the scenario where a rollout was resumed after being paused by the controller (e.g. via ArgoCD resume action). In that situation, the pauseConditions would have been cleared, but controllerPause would still be set to true. (same pattern as Rollout CR)",
 							Type:        []string{"boolean"},
 							Format:      "",
 						},
@@ -4999,7 +5013,7 @@ func schema_pkg_apis_rollouts_v1alpha1_RolloutPluginStatus(ref common.ReferenceC
 			},
 		},
 		Dependencies: []string{
-			"github.com/argoproj/argo-rollouts/pkg/apis/rollouts/v1alpha1.CanaryStatus", "github.com/argoproj/argo-rollouts/pkg/apis/rollouts/v1alpha1.RolloutPluginCondition", "k8s.io/apimachinery/pkg/apis/meta/v1.Time"},
+			"github.com/argoproj/argo-rollouts/pkg/apis/rollouts/v1alpha1.CanaryStatus", "github.com/argoproj/argo-rollouts/pkg/apis/rollouts/v1alpha1.PauseCondition", "github.com/argoproj/argo-rollouts/pkg/apis/rollouts/v1alpha1.RolloutPluginCondition", "k8s.io/apimachinery/pkg/apis/meta/v1.Time"},
 	}
 }
 

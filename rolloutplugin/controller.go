@@ -232,9 +232,29 @@ func (r *RolloutPluginReconciler) reconcile(ctx context.Context, rolloutPlugin *
 		newStatus.Restart = false // TODOH
 	}
 
-	// Check if spec.paused is set (manual pause by user)
-	if rolloutPlugin.Spec.Paused {
-		if !newStatus.Paused {
+	// ========================================
+	// PromoteFull check - MUST be before pause/resume logic
+	// ========================================
+	// Like the Rollout CR (canary.go:401), PromoteFull clears all pause state
+	// and lets the rollout proceed to processCanaryRollout where it will be handled.
+	// This must be checked before spec.paused early return, otherwise PromoteFull
+	// can never be triggered while paused.
+	if newStatus.PromoteFull {
+		logCtx.Info("PromoteFull detected, clearing pause state")
+		// Clear all pause state - same as Rollout CR's syncRolloutStatusCanary
+		newStatus.PauseConditions = nil
+		newStatus.ControllerPause = false
+		newStatus.PauseStartTime = nil
+		newStatus.Phase = "Progressing"
+		newStatus.Message = "Full promotion in progress"
+
+		// If manually paused via spec, we still proceed - PromoteFull takes priority
+		// The processCanaryRollout function will handle the actual promotion
+		// Fall through to processRollout below
+	} else if rolloutPlugin.Spec.Paused {
+		// Check if spec.paused is set (manual pause by user)
+		// NOTE: PromoteFull bypasses this block entirely
+		if newStatus.Phase != "Paused" {
 			logCtx.Info("Rollout manually paused by user")
 
 			// Record pause event
@@ -246,29 +266,20 @@ func (r *RolloutPluginReconciler) reconcile(ctx context.Context, rolloutPlugin *
 
 			now := metav1.Now()
 			newStatus.PauseStartTime = &now
-			newStatus.Paused = true
 			newStatus.Phase = "Paused"
 			newStatus.Message = "manually paused"
 		}
 		return ctrl.Result{}, r.updateStatus(ctx, rolloutPlugin, newStatus, logCtx)
-	}
-
-	// If spec.paused was false but status.paused is true, user is manually resuming
-	// Only clear pause state if it was a manual pause (not a step pause)
-	// Step pauses are managed within processCanaryRollout logic
-	if newStatus.Paused && !rolloutPlugin.Spec.Paused && newStatus.CurrentStepIndex == nil {
-		// This was a manual pause that's being resumed
-		logCtx.Info("Resuming RolloutPlugin from manual pause")
-
-		// Record resume event
-		if r.Recorder != nil {
-			r.Recorder.Eventf(rolloutPlugin, record.EventOptions{
-				EventReason: "RolloutPluginResumed",
-			}, "RolloutPlugin resumed from manual pause")
-		}
-
-		newStatus.Paused = false
+	} else if newStatus.Phase == "Paused" && !rolloutPlugin.Spec.Paused && len(newStatus.PauseConditions) == 0 {
+		// Manual resume detected: spec.paused was cleared but Phase is still "Paused"
+		// Clear all pause state so Phase transitions back to Progressing
+		logCtx.Info("Manual resume detected, clearing pause state")
 		newStatus.PauseStartTime = nil
+		if newStatus.RolloutInProgress {
+			newStatus.Phase = "Progressing"
+			newStatus.Message = "Rollout resumed"
+		}
+		// Fall through to continue processing
 	}
 
 	// Check if manual abort is requested via status.Abort field
@@ -435,8 +446,19 @@ func (r *RolloutPluginReconciler) reconcile(ctx context.Context, rolloutPlugin *
 		// Reset restart counter for new rollout
 		newStatus.RestartCount = 0
 		newStatus.RestartedAt = nil
-		// newStatus.CurrentStepIndex = nil // TODOH
-		// newStatus.Phase = "Progressing"
+
+		// Reset step index so the new rollout starts from step 0
+		// Without this, a new revision detected mid-rollout (e.g. after abort + new spec change)
+		// would resume from the old step index, skipping earlier steps including pause steps.
+		newStatus.CurrentStepIndex = nil
+		newStatus.CurrentStepComplete = false
+		newStatus.Phase = "Progressing"
+		newStatus.Message = "New revision detected, restarting rollout from step 0"
+
+		// Clear pause state from previous rollout
+		newStatus.PauseConditions = nil
+		newStatus.ControllerPause = false
+		newStatus.PauseStartTime = nil
 	}
 
 	// Check if we need to start a rollout
@@ -533,7 +555,9 @@ func (r *RolloutPluginReconciler) checkPausedConditions(ctx context.Context, rol
 	progCond := conditions.GetRolloutPluginCondition(*newStatus, conditions.RolloutPluginProgressing)
 	progCondPaused := progCond != nil && progCond.Reason == conditions.RolloutPluginPausedReason
 
-	isPaused := rolloutPlugin.Spec.Paused || newStatus.Paused
+	// Paused state is determined by spec.Paused (manual) or PauseConditions (controller-set step pauses)
+	// This aligns with Rollout CR where isPaused = spec.Paused || len(pauseConditions) > 0
+	isPaused := rolloutPlugin.Spec.Paused || len(newStatus.PauseConditions) > 0
 	abortCondExists := progCond != nil && progCond.Reason == conditions.RolloutPluginAbortedReason
 	completedCondExists := conditions.GetRolloutPluginCondition(*newStatus, conditions.RolloutPluginCompleted) != nil
 
@@ -576,10 +600,11 @@ func (r *RolloutPluginReconciler) checkPausedConditions(ctx context.Context, rol
 		logCtx.Info("Setting Progressing condition to Restart after abort")
 	}
 
-	// Update Paused condition
+	// Update Paused condition (RolloutPluginCondition, not PauseConditions)
 	pauseCond := conditions.GetRolloutPluginCondition(*newStatus, conditions.RolloutPluginPaused)
 	pausedCondTrue := pauseCond != nil && pauseCond.Status == corev1.ConditionTrue
 
+	// isPaused uses PauseConditions (controller step pauses) and spec.Paused (manual)
 	if (isPaused != pausedCondTrue) && !abortCondExists {
 		condStatus := corev1.ConditionFalse
 		if isPaused {
@@ -635,7 +660,7 @@ func (r *RolloutPluginReconciler) processCanaryRollout(ctx context.Context, roll
 	if newStatus.PromoteFull {
 		logCtx.Info("PromoteFull is set, skipping remaining steps and promoting immediately")
 
-		// Promote the rollout
+		// Promote the rollout (set partition to 0)
 		if err := plugin.Promote(ctx, workloadRef); err != nil {
 			logCtx.WithError(err).Error("Failed to promote during full promotion")
 			newStatus.Phase = "Failed"
@@ -643,31 +668,23 @@ func (r *RolloutPluginReconciler) processCanaryRollout(ctx context.Context, roll
 			return ctrl.Result{}, err
 		}
 
-		// Record completion event
-		if r.Recorder != nil {
-			r.Recorder.Eventf(rolloutPlugin, record.EventOptions{
-				EventReason: conditions.RolloutPluginCompletedReason,
-			}, "RolloutPlugin completed update to revision %s (full promotion)", newStatus.UpdatedRevision)
-		}
-
-		newStatus.Phase = "Successful"
-		newStatus.Message = "Rollout promoted successfully (full promotion)"
-		newStatus.RolloutInProgress = false
-		newStatus.PromoteFull = false // Clear the flag
-		newStatus.Paused = false
+		// Clear PromoteFull flag and pause state
+		newStatus.PromoteFull = false
+		newStatus.PauseConditions = nil
+		newStatus.ControllerPause = false
 		newStatus.PauseStartTime = nil
 
-		// Remove progressing condition and set completed condition
-		conditions.RemoveRolloutPluginCondition(newStatus, conditions.RolloutPluginProgressing)
-		completedCondition := conditions.NewRolloutPluginCondition(
-			conditions.RolloutPluginCompleted,
-			corev1.ConditionTrue,
-			conditions.RolloutPluginCompletedReason,
-			"RolloutPlugin promoted successfully (full promotion)")
-		conditions.SetRolloutPluginCondition(newStatus, *completedCondition)
+		// Advance step index to beyond last step so normal completion logic handles the rest.
+		// Keep RolloutInProgress = true so the next reconcile doesn't mistake this for a new rollout
+		// (CurrentRevision != UpdatedRevision until all pods converge).
+		// This matches the Rollout CR pattern where PromoteFull sets currentStepIndex = stepCount.
+		stepCount := int32(len(canary.Steps))
+		newStatus.CurrentStepIndex = &stepCount
+		newStatus.Phase = "Progressing"
+		newStatus.Message = "Full promotion in progress, waiting for pods to converge"
 
-		logCtx.Info("Full promotion completed successfully")
-		return ctrl.Result{}, nil
+		logCtx.Info("Full promotion initiated, waiting for convergence")
+		return ctrl.Result{RequeueAfter: 5 * time.Second}, nil
 	}
 
 	// Reconcile analysis runs if AnalysisHelper is available
@@ -702,14 +719,30 @@ func (r *RolloutPluginReconciler) processCanaryRollout(ctx context.Context, roll
 
 	currentStepIndex := *newStatus.CurrentStepIndex
 	if currentStepIndex >= int32(len(canary.Steps)) {
-		// All steps completed
-		logCtx.Info("All canary steps completed, promoting")
+		// All steps completed (or PromoteFull advanced past last step)
+		// Ensure partition is set to 0 (idempotent - harmless if already 0)
 		if err := plugin.Promote(ctx, workloadRef); err != nil {
 			logCtx.WithError(err).Error("Failed to promote")
 			newStatus.Phase = "Failed"
 			newStatus.Message = fmt.Sprintf("Failed to promote: %v", err)
 			return ctrl.Result{}, err
 		}
+
+		// Wait for pods to converge (CurrentRevision == UpdatedRevision) before declaring success.
+		// Without this check, setting RolloutInProgress=false while CurrentRevision != UpdatedRevision
+		// causes the next reconcile to mistake the still-converging pods for a new rollout and
+		// restart canary steps from the beginning, which overwrites partition=0.
+		if newStatus.CurrentRevision != newStatus.UpdatedRevision {
+			logCtx.WithFields(log.Fields{
+				"currentRevision": newStatus.CurrentRevision,
+				"updatedRevision": newStatus.UpdatedRevision,
+			}).Info("Waiting for pods to converge before completing rollout")
+			newStatus.Phase = "Progressing"
+			newStatus.Message = "Waiting for all pods to be updated"
+			return ctrl.Result{RequeueAfter: 5 * time.Second}, nil
+		}
+
+		logCtx.Info("All canary steps completed and pods converged, completing rollout")
 
 		// Record completion event
 		if r.Recorder != nil {
@@ -761,9 +794,16 @@ func (r *RolloutPluginReconciler) processCanaryRollout(ctx context.Context, roll
 			return ctrl.Result{}, nil
 
 		case v1alpha1.AnalysisPhaseInconclusive:
-			// Background analysis is inconclusive, pause the rollout
+			// Background analysis is inconclusive, pause the rollout using PauseConditions
 			logCtx.Info("Background analysis is inconclusive, pausing rollout")
-			newStatus.Paused = true
+			now := timeutil.MetaNow()
+			newStatus.PauseConditions = append(newStatus.PauseConditions, v1alpha1.PauseCondition{
+				Reason:    v1alpha1.PauseReasonInconclusiveAnalysis,
+				StartTime: now,
+			})
+			newStatus.ControllerPause = true
+			newStatus.PauseStartTime = &now
+			newStatus.Phase = "Paused"
 			newStatus.Message = "Paused: Background analysis inconclusive"
 			return ctrl.Result{}, nil
 		}
@@ -802,11 +842,16 @@ func (r *RolloutPluginReconciler) processCanaryRollout(ctx context.Context, roll
 		newStatus.CurrentStepIndex = &nextStep
 
 		// If next step is a pause, initialize pause state immediately
-		// This ensures Paused and PauseStartTime are set atomically with CurrentStepIndex
+		// This ensures PauseConditions and PauseStartTime are set atomically with CurrentStepIndex
 		if nextStep < int32(len(canary.Steps)) && canary.Steps[nextStep].Pause != nil {
-			now := metav1.Now()
+			now := timeutil.MetaNow()
+			newStatus.PauseConditions = append(newStatus.PauseConditions, v1alpha1.PauseCondition{
+				Reason:    v1alpha1.PauseReasonCanaryPauseStep,
+				StartTime: now,
+			})
+			newStatus.ControllerPause = true
 			newStatus.PauseStartTime = &now
-			newStatus.Paused = true
+			newStatus.Phase = "Paused"
 			newStatus.Message = "Paused"
 			logCtx.WithFields(log.Fields{
 				"nextStep": nextStep,
@@ -849,11 +894,16 @@ func (r *RolloutPluginReconciler) processCanaryRollout(ctx context.Context, roll
 			newStatus.Message = "Analysis successful"
 
 			// If next step is a pause, initialize pause state immediately
-			// This ensures Paused and PauseStartTime are set atomically with CurrentStepIndex
+			// This ensures PauseConditions and PauseStartTime are set atomically with CurrentStepIndex
 			if nextStep < int32(len(canary.Steps)) && canary.Steps[nextStep].Pause != nil {
-				now := metav1.Now()
+				now := timeutil.MetaNow()
+				newStatus.PauseConditions = append(newStatus.PauseConditions, v1alpha1.PauseCondition{
+					Reason:    v1alpha1.PauseReasonCanaryPauseStep,
+					StartTime: now,
+				})
+				newStatus.ControllerPause = true
 				newStatus.PauseStartTime = &now
-				newStatus.Paused = true
+				newStatus.Phase = "Paused"
 				newStatus.Message = "Paused"
 				logCtx.WithFields(log.Fields{
 					"nextStep": nextStep,
@@ -882,9 +932,16 @@ func (r *RolloutPluginReconciler) processCanaryRollout(ctx context.Context, roll
 			return ctrl.Result{}, nil
 
 		case v1alpha1.AnalysisPhaseInconclusive:
-			// Analysis is inconclusive, pause the rollout
+			// Analysis is inconclusive, pause the rollout using PauseConditions
 			logCtx.Info("Step analysis is inconclusive, pausing rollout")
-			newStatus.Paused = true
+			now := timeutil.MetaNow()
+			newStatus.PauseConditions = append(newStatus.PauseConditions, v1alpha1.PauseCondition{
+				Reason:    v1alpha1.PauseReasonInconclusiveAnalysis,
+				StartTime: now,
+			})
+			newStatus.ControllerPause = true
+			newStatus.PauseStartTime = &now
+			newStatus.Phase = "Paused"
 			newStatus.Message = "Paused: Analysis inconclusive"
 			return ctrl.Result{}, nil
 
@@ -904,29 +961,68 @@ func (r *RolloutPluginReconciler) processCanaryRollout(ctx context.Context, roll
 	}
 
 	// Handle pause step
+	// Uses PauseConditions + ControllerPause pattern (same as Rollout CR):
+	// - Controller sets PauseConditions + ControllerPause=true when pausing
+	// - User clears PauseConditions to resume (via ArgoCD Lua / kubectl)
+	// - Controller detects ControllerPause=true && PauseConditions=nil → step completed
 	if currentStep.Pause != nil {
 		logCtx.WithField("pauseStartTime", newStatus.PauseStartTime).Info("Processing pause step")
 
-		if newStatus.PauseStartTime == nil {
-			now := metav1.Now()
-			newStatus.PauseStartTime = &now
-			newStatus.Paused = true
-			newStatus.Message = "Paused"
+		pauseCondition := getRolloutPluginPauseCondition(rolloutPlugin, v1alpha1.PauseReasonCanaryPauseStep)
 
-			// Record pause event (step pause)
-			if r.Recorder != nil {
-				r.Recorder.Eventf(rolloutPlugin, record.EventOptions{
-					EventReason: conditions.RolloutPluginPausedReason,
-				}, "RolloutPlugin paused at step %d", currentStepIndex)
+		if pauseCondition == nil {
+			// No pause condition exists. Two scenarios:
+			// 1. ControllerPause=false → first time hitting this step, need to add pause condition
+			// 2. ControllerPause=true → user has cleared pauseConditions (promoted), step is complete
+			if !newStatus.ControllerPause {
+				// First time at this pause step: set PauseConditions + ControllerPause
+				now := timeutil.MetaNow()
+				newStatus.PauseConditions = append(newStatus.PauseConditions, v1alpha1.PauseCondition{
+					Reason:    v1alpha1.PauseReasonCanaryPauseStep,
+					StartTime: now,
+				})
+				newStatus.ControllerPause = true
+				newStatus.PauseStartTime = &now
+				newStatus.Phase = "Paused"
+				newStatus.Message = "Paused"
+
+				// Record pause event (step pause)
+				if r.Recorder != nil {
+					r.Recorder.Eventf(rolloutPlugin, record.EventOptions{
+						EventReason: conditions.RolloutPluginPausedReason,
+					}, "RolloutPlugin paused at step %d", currentStepIndex)
+				}
+
+				logCtx.WithField("duration", currentStep.Pause.Duration).Info("Starting pause")
+				return ctrl.Result{}, nil
 			}
 
-			logCtx.WithField("duration", currentStep.Pause.Duration).Info("Starting pause")
-			// Update status to persist pause start time
-			// Status update will trigger another reconcile, no need for immediate requeue
-			return ctrl.Result{}, nil
+			// ControllerPause=true && PauseCondition=nil → user promoted (cleared pauseConditions)
+			logCtx.Info("Rollout has been unpaused (user cleared pauseConditions)")
+
+			// Record resume event
+			if r.Recorder != nil {
+				r.Recorder.Eventf(rolloutPlugin, record.EventOptions{
+					EventReason: "RolloutPluginResumed",
+				}, "RolloutPlugin resumed from pause at step %d", currentStepIndex)
+			}
+
+			// Clear pause state and advance to next step
+			newStatus.ControllerPause = false
+			newStatus.PauseConditions = nil
+			newStatus.PauseStartTime = nil
+
+			nextStep := currentStepIndex + 1
+			newStatus.CurrentStepIndex = &nextStep
+			newStatus.CurrentStepComplete = false
+			logCtx.WithFields(log.Fields{
+				"fromStep": currentStepIndex,
+				"toStep":   nextStep,
+			}).Info("Advancing past pause step on resume")
+			return ctrl.Result{Requeue: true}, nil
 		}
 
-		// Check if pause duration has elapsed
+		// Pause condition exists - check if timed pause duration has elapsed
 		if currentStep.Pause.Duration != nil {
 			durationStr := currentStep.Pause.Duration.String()
 			duration, err := time.ParseDuration(durationStr)
@@ -937,7 +1033,7 @@ func (r *RolloutPluginReconciler) processCanaryRollout(ctx context.Context, roll
 				return ctrl.Result{}, err
 			}
 
-			elapsed := time.Since(newStatus.PauseStartTime.Time)
+			elapsed := time.Since(pauseCondition.StartTime.Time)
 			if elapsed >= duration {
 				logCtx.Info("Pause duration elapsed, moving to next step")
 
@@ -948,25 +1044,23 @@ func (r *RolloutPluginReconciler) processCanaryRollout(ctx context.Context, roll
 					}, "RolloutPlugin resumed from pause at step %d", currentStepIndex)
 				}
 
-				// Move to next step
+				// Clear pause state and move to next step
+				newStatus.ControllerPause = false
+				newStatus.PauseConditions = nil
+				newStatus.PauseStartTime = nil
+
 				nextStep := currentStepIndex + 1
 				newStatus.CurrentStepIndex = &nextStep
 				newStatus.CurrentStepComplete = false
-				newStatus.PauseStartTime = nil
-				newStatus.Paused = false
-				// Requeue immediately to process next step
-				// Pause completion doesn't modify the workload, so no watch trigger
 				return ctrl.Result{Requeue: true}, nil
 			}
 
 			remaining := duration - elapsed
 			newStatus.Message = fmt.Sprintf("Paused (remaining: %s)", remaining.Round(time.Second))
-			//logCtx.WithField("remaining", remaining).Info("Still paused")
-			// Requeue when pause should be done
 			return ctrl.Result{RequeueAfter: remaining}, nil
 		}
 
-		// Indefinite pause - wait for manual promotion
+		// Indefinite pause - wait for manual promotion (user clears pauseConditions)
 		logCtx.Info("Rollout is paused indefinitely, waiting for manual promotion")
 		return ctrl.Result{}, nil
 	}
@@ -981,11 +1075,16 @@ func (r *RolloutPluginReconciler) processCanaryRollout(ctx context.Context, roll
 	newStatus.Message = fmt.Sprintf("Completed step %d", currentStepIndex)
 
 	// If next step is a pause, initialize pause state immediately
-	// This ensures Paused and PauseStartTime are set atomically with CurrentStepIndex
+	// This ensures PauseConditions and PauseStartTime are set atomically with CurrentStepIndex
 	if nextStep < int32(len(canary.Steps)) && canary.Steps[nextStep].Pause != nil {
-		now := metav1.Now()
+		now := timeutil.MetaNow()
+		newStatus.PauseConditions = append(newStatus.PauseConditions, v1alpha1.PauseCondition{
+			Reason:    v1alpha1.PauseReasonCanaryPauseStep,
+			StartTime: now,
+		})
+		newStatus.ControllerPause = true
 		newStatus.PauseStartTime = &now
-		newStatus.Paused = true
+		newStatus.Phase = "Paused"
 		newStatus.Message = "Paused"
 		logCtx.WithFields(log.Fields{
 			"nextStep": nextStep,
@@ -998,6 +1097,17 @@ func (r *RolloutPluginReconciler) processCanaryRollout(ctx context.Context, roll
 	// Requeue immediately to process next step
 	return ctrl.Result{Requeue: true}, nil
 } //TODO return ctrl.Result{}, nil ?
+
+// getRolloutPluginPauseCondition returns the pause condition with the specified reason, or nil if not found.
+// This mirrors the Rollout CR's getPauseCondition function in rollout/pause.go.
+func getRolloutPluginPauseCondition(rolloutPlugin *v1alpha1.RolloutPlugin, reason v1alpha1.PauseReason) *v1alpha1.PauseCondition {
+	for _, cond := range rolloutPlugin.Status.PauseConditions {
+		if cond.Reason == reason {
+			return &cond
+		}
+	}
+	return nil
+}
 
 func (r *RolloutPluginReconciler) processRestart(ctx context.Context, rolloutPlugin *v1alpha1.RolloutPlugin, newStatus *v1alpha1.RolloutPluginStatus, plugin ResourcePlugin, workloadRef v1alpha1.WorkloadRef, logCtx *log.Entry) (ctrl.Result, error) {
 	logCtx.WithFields(log.Fields{"attempt": newStatus.RestartCount + 1}).Info("Processing rollout restart from step 0")
@@ -1041,7 +1151,8 @@ func (r *RolloutPluginReconciler) processRestart(ctx context.Context, rolloutPlu
 	newStatus.CurrentStepIndex = &stepZero
 	newStatus.CurrentStepComplete = false
 	newStatus.RolloutInProgress = true
-	newStatus.Paused = false
+	newStatus.PauseConditions = nil
+	newStatus.ControllerPause = false
 	newStatus.PauseStartTime = nil
 	newStatus.Aborted = false
 	newStatus.Abort = false // Clear abort flag to prevent re-abort
