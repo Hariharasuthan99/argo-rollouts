@@ -252,7 +252,7 @@ func TestProcessCanaryRollout_SetWeightVerifiedMovesToPause(t *testing.T) {
 	if assert.NotNil(t, newStatus.CurrentStepIndex) {
 		assert.Equal(t, int32(1), *newStatus.CurrentStepIndex)
 	}
-	assert.True(t, newStatus.Paused)
+	assert.True(t, newStatus.ControllerPause)
 	assert.NotNil(t, newStatus.PauseStartTime)
 	assert.Equal(t, "Paused", newStatus.Message)
 	assert.Equal(t, 1, plugin.setWeightCalls)
@@ -277,7 +277,7 @@ func TestProcessCanaryRollout_PauseDurationElapsedAdvancesStep(t *testing.T) {
 	newStatus := &v1alpha1.RolloutPluginStatus{
 		RolloutInProgress: true,
 		CurrentStepIndex:  &stepIndex,
-		Paused:            true,
+		ControllerPause:   true,
 		PauseStartTime:    &started,
 	}
 
@@ -288,7 +288,7 @@ func TestProcessCanaryRollout_PauseDurationElapsedAdvancesStep(t *testing.T) {
 	if assert.NotNil(t, newStatus.CurrentStepIndex) {
 		assert.Equal(t, int32(1), *newStatus.CurrentStepIndex)
 	}
-	assert.False(t, newStatus.Paused)
+	assert.False(t, newStatus.ControllerPause)
 	assert.Nil(t, newStatus.PauseStartTime)
 }
 
@@ -366,7 +366,7 @@ func TestProcessCanaryRollout_AnalysisSuccessfulMovesToNextStep(t *testing.T) {
 		assert.Equal(t, int32(1), *newStatus.CurrentStepIndex)
 	}
 	assert.Equal(t, "Analysis successful", newStatus.Message)
-	assert.False(t, newStatus.Paused)
+	assert.False(t, newStatus.ControllerPause)
 }
 
 func TestProcessCanaryRollout_PromoteFullCompletesRollout(t *testing.T) {
@@ -388,7 +388,7 @@ func TestProcessCanaryRollout_PromoteFullCompletesRollout(t *testing.T) {
 	newStatus := &v1alpha1.RolloutPluginStatus{
 		RolloutInProgress: true,
 		PromoteFull:       true,
-		Paused:            true,
+		ControllerPause:   true,
 		PauseStartTime:    &pausedAt,
 		Conditions: []v1alpha1.RolloutPluginCondition{*conditions.NewRolloutPluginCondition(
 			conditions.RolloutPluginProgressing,
@@ -401,17 +401,18 @@ func TestProcessCanaryRollout_PromoteFullCompletesRollout(t *testing.T) {
 	result, err := reconciler.processCanaryRollout(context.Background(), rolloutPlugin, newStatus, plugin, v1alpha1.WorkloadRef{}, logCtx)
 	assert.NoError(t, err)
 	assert.False(t, result.Requeue)
+	assert.Equal(t, 5*time.Second, result.RequeueAfter)
 	assert.Equal(t, 1, plugin.promoteCalls)
-	assert.Equal(t, "Successful", newStatus.Phase)
-	assert.Equal(t, "Rollout promoted successfully (full promotion)", newStatus.Message)
-	assert.False(t, newStatus.RolloutInProgress)
+	assert.Equal(t, "Progressing", newStatus.Phase)
+	assert.Equal(t, "Full promotion in progress, waiting for pods to converge", newStatus.Message)
+	assert.True(t, newStatus.RolloutInProgress)
 	assert.False(t, newStatus.PromoteFull)
-	assert.False(t, newStatus.Paused)
+	assert.False(t, newStatus.ControllerPause)
 	assert.Nil(t, newStatus.PauseStartTime)
-	assert.Nil(t, conditions.GetRolloutPluginCondition(*newStatus, conditions.RolloutPluginProgressing))
-	completed := conditions.GetRolloutPluginCondition(*newStatus, conditions.RolloutPluginCompleted)
-	if assert.NotNil(t, completed) {
-		assert.Equal(t, corev1.ConditionTrue, completed.Status)
-		assert.Equal(t, conditions.RolloutPluginCompletedReason, completed.Reason)
+	if assert.NotNil(t, newStatus.CurrentStepIndex) {
+		assert.Equal(t, int32(len(rolloutPlugin.Spec.Strategy.Canary.Steps)), *newStatus.CurrentStepIndex)
 	}
+	assert.NotNil(t, conditions.GetRolloutPluginCondition(*newStatus, conditions.RolloutPluginProgressing))
+	completed := conditions.GetRolloutPluginCondition(*newStatus, conditions.RolloutPluginCompleted)
+	assert.Nil(t, completed)
 }
