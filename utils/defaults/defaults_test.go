@@ -157,6 +157,20 @@ func TestGetProgressDeadlineSecondsOrDefault(t *testing.T) {
 	assert.Equal(t, DefaultProgressDeadlineSeconds, GetProgressDeadlineSecondsOrDefault(rolloutDefaultValue))
 }
 
+func TestGetRolloutPluginProgressDeadlineSecondsOrDefault(t *testing.T) {
+	seconds := int32(9)
+	rolloutPluginNonDefaultValue := &v1alpha1.RolloutPlugin{
+		Spec: v1alpha1.RolloutPluginSpec{
+			ProgressDeadlineSeconds: &seconds,
+		},
+	}
+
+	assert.Equal(t, seconds, GetRolloutPluginProgressDeadlineSecondsOrDefault(rolloutPluginNonDefaultValue))
+
+	rolloutPluginDefaultValue := &v1alpha1.RolloutPlugin{}
+	assert.Equal(t, DefaultProgressDeadlineSeconds, GetRolloutPluginProgressDeadlineSecondsOrDefault(rolloutPluginDefaultValue))
+}
+
 func TestGetScaleDownDelaySecondsOrDefault(t *testing.T) {
 	{
 		scaleDownDelaySeconds := int32(60)
