@@ -1,0 +1,77 @@
+---
+# RBAC permissions for Argo CD to manage RolloutPlugin resources
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: argocd-rolloutplugin-controller
+  labels:
+    app.kubernetes.io/component: application-controller
+    app.kubernetes.io/name: argocd-rolloutplugin-controller
+    app.kubernetes.io/part-of: argocd
+rules:
+- apiGroups:
+  - argoproj.io
+  resources:
+  - rolloutplugins
+  - rolloutplugins/status
+  verbs:
+  - get
+  - list
+  - watch
+  - update
+  - patch
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: argocd-rolloutplugin-controller
+  labels:
+    app.kubernetes.io/component: application-controller
+    app.kubernetes.io/name: argocd-rolloutplugin-controller
+    app.kubernetes.io/part-of: argocd
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: ClusterRole
+  name: argocd-rolloutplugin-controller
+subjects:
+- kind: ServiceAccount
+  name: argocd-application-controller
+  namespace: argocd
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: argocd-rolloutplugin-server
+  labels:
+    app.kubernetes.io/component: server
+    app.kubernetes.io/name: argocd-rolloutplugin-server
+    app.kubernetes.io/part-of: argocd
+rules:
+- apiGroups:
+  - argoproj.io
+  resources:
+  - rolloutplugins
+  - rolloutplugins/status
+  verbs:
+  - get
+  - list
+  - watch
+  - update
+  - patch
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: argocd-rolloutplugin-server
+  labels:
+    app.kubernetes.io/component: server
+    app.kubernetes.io/name: argocd-rolloutplugin-server
+    app.kubernetes.io/part-of: argocd
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: ClusterRole
+  name: argocd-rolloutplugin-server
+subjects:
+- kind: ServiceAccount
+  name: argocd-server
+  namespace: argocd

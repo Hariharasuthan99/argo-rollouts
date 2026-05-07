@@ -1,0 +1,138 @@
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: argocd-cm
+  namespace: argocd
+  labels:
+    app.kubernetes.io/name: argocd-cm
+    app.kubernetes.io/part-of: argocd
+data:
+  # Health check for RolloutPlugin
+  resource.customizations.health.argoproj.io_RolloutPlugin: |
+    hs = {}
+    if obj.status ~= nil then
+      if obj.status.phase == "Healthy" then
+        hs.status = "Healthy"
+        hs.message = obj.status.message or "RolloutPlugin is healthy"
+      elseif obj.status.phase == "Progressing" then
+        hs.status = "Progressing"
+        hs.message = obj.status.message or "RolloutPlugin is progressing"
+      elseif obj.status.phase == "Paused" then
+        hs.status = "Suspended"
+        hs.message = obj.status.message or "RolloutPlugin is paused"
+      elseif obj.status.phase == "Degraded" then
+        hs.status = "Degraded"
+        hs.message = obj.status.message or "RolloutPlugin is degraded"
+      else
+        hs.status = "Unknown"
+        hs.message = "RolloutPlugin phase is " .. (obj.status.phase or "unknown")
+      end
+    else
+      hs.status = "Unknown"
+      hs.message = "No status available"
+    end
+    return hs
+
+  # Actions for RolloutPlugin
+  resource.customizations.actions.argoproj.io_RolloutPlugin: |
+    discovery.lua: |
+      local actions = {}
+      
+      -- Get status fields
+      local progressing = false
+      local paused = false
+      local aborted = false
+      local phase = ""
+      local rolloutActive = false
+      
+      if obj.status ~= nil then
+        if obj.status.phase ~= nil then
+          phase = obj.status.phase
+          progressing = (phase == "Progressing")
+        end
+        if obj.status.pauseConditions ~= nil and #obj.status.pauseConditions > 0 then
+          paused = true
+        end
+        if obj.status.aborted ~= nil then
+          aborted = obj.status.aborted
+        end
+      end
+      
+      -- Check spec.paused for manual pause
+      local specPaused = false
+      if obj.spec ~= nil and obj.spec.paused ~= nil then
+        specPaused = obj.spec.paused
+      end
+      
+      -- A rollout is "active" when it is progressing or paused (i.e. mid-rollout)
+      rolloutActive = progressing or paused or specPaused or (phase == "Paused")
+      
+      -- Pause: Enable when rollout is progressing and not already paused
+      actions["pause"] = {
+        ["disabled"] = not progressing or paused or specPaused
+      }
+      
+      -- Resume: Enable when paused (either pauseConditions or spec.paused) and not aborted
+        actions["resume"] = {
+          ["disabled"] = not (paused or specPaused) or aborted
+        }
+      
+      -- Promote Full: Enable when rollout is active (progressing or paused) and not aborted
+      actions["promoteFull"] = {
+        ["disabled"] = not rolloutActive or aborted
+      }
+      
+      -- Abort: Enable when rollout is active (progressing or paused) and not already aborted
+      actions["abort"] = {
+        ["disabled"] = not rolloutActive or aborted
+      }
+      
+      -- Restart: Enable only when rollout is aborted
+      actions["restart"] = {
+        ["disabled"] = not aborted
+      }
+      
+      return actions
+    definitions:
+    - name: pause
+      action.lua: |
+        if obj.spec == nil then
+          obj.spec = {}
+        end
+        obj.spec.paused = true
+        return obj
+    - name: resume
+      action.lua: |
+        -- Same pattern as Rollout CR resume action: conditionally clear pauseConditions and spec.paused
+        if obj.status ~= nil then
+          if obj.status.pauseConditions ~= nil and #obj.status.pauseConditions > 0 then
+            obj.status.pauseConditions = nil
+          end
+        end
+        if obj.spec ~= nil and obj.spec.paused ~= nil and obj.spec.paused then
+          obj.spec.paused = false
+        end
+        return obj
+    - name: promoteFull
+      action.lua: |
+        -- Same pattern as Rollout CR: just set promoteFull=true
+        -- Controller handles clearing all pause state internally
+        if obj.status == nil then
+          obj.status = {}
+        end
+        obj.status.promoteFull = true
+        return obj
+    - name: abort
+      action.lua: |
+        if obj.status == nil then
+          obj.status = {}
+        end
+        obj.status.abort = true
+        return obj
+    - name: restart
+      action.lua: |
+        if obj.status == nil then
+          obj.status = {}
+        end
+        obj.status.restart = true
+        return obj

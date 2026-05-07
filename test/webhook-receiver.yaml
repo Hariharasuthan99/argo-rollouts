@@ -1,0 +1,157 @@
+# Simple webhook receiver for testing notifications
+# This deployment creates a pod that logs all incoming webhook requests
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: webhook-receiver-script
+  namespace: argo-rollouts  # Change to your namespace
+data:
+  server.py: |
+    #!/usr/bin/env python3
+    from http.server import BaseHTTPRequestHandler, HTTPServer
+    import json
+    import sys
+    from datetime import datetime
+    
+    class WebhookHandler(BaseHTTPRequestHandler):
+        def do_POST(self):
+            try:
+                # Log that we received a POST request
+                print(f"[INFO] Incoming POST request from {self.client_address[0]}", flush=True)
+                
+                # Get content length
+                content_length = int(self.headers.get('Content-Length', 0))
+                print(f"[DEBUG] Content-Length: {content_length}", flush=True)
+                
+                # Read the body
+                body = self.rfile.read(content_length).decode('utf-8')
+                
+                # Print timestamp
+                timestamp = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
+                print(f"\n{'='*80}", flush=True)
+                print(f"[{timestamp}] Received webhook POST request", flush=True)
+                print(f"{'='*80}", flush=True)
+                
+                # Print headers
+                print("\n--- Headers ---", flush=True)
+                for header, value in self.headers.items():
+                    print(f"{header}: {value}", flush=True)
+                
+                # Print body
+                print("\n--- Body ---", flush=True)
+                try:
+                    # Try to pretty print JSON
+                    parsed = json.loads(body)
+                    print(json.dumps(parsed, indent=2), flush=True)
+                except Exception as e:
+                    # If not JSON, print as is
+                    print(f"[WARN] Failed to parse as JSON: {e}", flush=True)
+                    print(body, flush=True)
+                
+                print(f"\n{'='*80}\n", flush=True)
+                
+                # Send response
+                self.send_response(200)
+                self.send_header('Content-type', 'application/json')
+                self.end_headers()
+                response = {"status": "received"}
+                self.wfile.write(json.dumps(response).encode())
+                print(f"[INFO] Response sent: 200 OK", flush=True)
+                
+            except Exception as e:
+                print(f"[ERROR] Exception in do_POST: {e}", flush=True)
+                self.send_error(500, f"Internal Server Error: {e}")
+        
+        def do_GET(self):
+            try:
+                print(f"[INFO] Health check from {self.client_address[0]}", flush=True)
+                # Health check endpoint
+                self.send_response(200)
+                self.send_header('Content-type', 'text/plain')
+                self.end_headers()
+                self.wfile.write(b'Webhook receiver is running')
+                print(f"[INFO] Health check response sent", flush=True)
+            except Exception as e:
+                print(f"[ERROR] Exception in do_GET: {e}", flush=True)
+        
+        def log_message(self, format, *args):
+            # Suppress default request logging (we do our own)
+            pass
+    
+    if __name__ == '__main__':
+        print("="*80, flush=True)
+        print("Webhook Receiver Starting...", flush=True)
+        print("="*80, flush=True)
+        print(f"[INFO] Python version: {sys.version}", flush=True)
+        print(f"[INFO] Binding to 0.0.0.0:8080", flush=True)
+        
+        try:
+            server_address = ('', 8080)
+            httpd = HTTPServer(server_address, WebhookHandler)
+            print(f'[SUCCESS] Webhook receiver started on port 8080', flush=True)
+            print(f'[INFO] Ready to receive notifications!', flush=True)
+            print("="*80, flush=True)
+            sys.stdout.flush()
+            httpd.serve_forever()
+        except Exception as e:
+            print(f"[FATAL] Failed to start server: {e}", flush=True)
+            sys.exit(1)
+
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: webhook-receiver
+  namespace: argo-rollouts  # Change to your namespace
+  labels:
+    app: webhook-receiver
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: webhook-receiver
+  template:
+    metadata:
+      labels:
+        app: webhook-receiver
+    spec:
+      containers:
+      - name: webhook-receiver
+        image: python:3.11-slim
+        command: ["python3", "/scripts/server.py"]
+        ports:
+        - containerPort: 8080
+          name: http
+        volumeMounts:
+        - name: script
+          mountPath: /scripts
+        resources:
+          requests:
+            memory: "64Mi"
+            cpu: "100m"
+          limits:
+            memory: "128Mi"
+            cpu: "200m"
+      volumes:
+      - name: script
+        configMap:
+          name: webhook-receiver-script
+          defaultMode: 0755
+
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: webhook-receiver
+  namespace: argo-rollouts
+spec:
+  type: NodePort  # Changed from ClusterIP
+  selector:
+    app: webhook-receiver
+  ports:
+  - port: 8080
+    targetPort: 8080
+    nodePort: 30080  # Choose a port in range 30000-32767
+    protocol: TCP
+    name: http
